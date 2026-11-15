@@ -1,0 +1,38 @@
+# Build output
+out/
+build/
+target/
+bin/
+*.class
+*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Generated data (keep only the small sample)
+data/*
+!data/sample.txt
+
+# Run results and generated figures
+results/top*.txt
+results/run_*/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local agent files and private notes
+AGENTS.md
+CLAUDE.md
+.claude/
+tmp/
+report/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
