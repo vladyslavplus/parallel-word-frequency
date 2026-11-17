@@ -96,11 +96,14 @@ final class WordCounter {
                     Map<String, Long> local = new HashMap<>(); // локальна мапа: інші потоки її не бачать, замки не потрібні
                     List<long[]> events = new ArrayList<>();
                     long bytes = 0, words = 0;
-                    // Статичний розподіл: потік id обробляє блоки [from, to), межі рівномірні й для непарного p.
+                    // Статичний розподіл: потік id отримує діапазон [from, to).
+                    // Приклад (10 блоків, 3 потоки): T0->[0..3), T1->[3..6), T2->[6..10).
+                    // int[1] замість int, бо лямбда в Java може змінювати елемент масиву, але не локальну змінну.
                     int[] next = {(int) ((long) id * blocks.size() / threads)};
                     int to = (int) ((long) (id + 1) * blocks.size() / threads);
                     while (true) {
-                        // Наступний блок: із черги (dynamic) або наступний зі свого діапазону (static); null - роботи немає.
+                        // dynamic: poll() потокобезпечно забирає наступний блок із голови черги (FIFO);
+                        // static: беремо наступний індекс зі свого діапазону; null = блоків більше немає.
                         Integer index = dynamic ? queue.poll() : next[0] < to ? Integer.valueOf(next[0]++) : null;
                         if (index == null) break;
                         long blockStart = System.nanoTime();
@@ -156,6 +159,12 @@ final class WordCounter {
      * Виділяє слова з блоку і додає їх у мапу counts; повертає кількість слів у блоці.
      * Слово - неперервна послідовність літер Unicode у нижньому регістрі. Апостроф між двома літерами
      * залишається в слові (п'ять, don't); три різновиди апострофа зберігаються як '.
+     *
+     * Приклад: текст "Кіт, п'ять! кіт"
+     * -> 'К','і','т' -> "кіт" (у мапу: кіт=1)
+     * -> ',' (роздільник, ігноруємо)
+     * -> "п'ять" (апостроф між 'п' і 'я' зберігся -> у мапу: п'ять=1)
+     * -> "кіт" (уже є в мапі -> merge додає +1, стає кіт=2).
      */
     static long countWords(byte[] block, Map<String, Long> counts) {
         String text = new String(block, StandardCharsets.UTF_8); // декодування лише цього блоку, не всього файлу
