@@ -20,22 +20,34 @@ record Corpus(List<byte[]> blocks, long bytes) {
     static Corpus read(List<Path> files, int blockSize) throws IOException {
         List<byte[]> blocks = new ArrayList<>();
         long bytes = 0;
-        byte[] buffer = new byte[blockSize]; // один буфер на все читання
+        byte[] buffer = new byte[blockSize]; // Один багаторазовий буфер (256 КБ) на все читання, щоб не створювати зайве сміття для GC
         for (Path file : files) {
             try (InputStream in = Files.newInputStream(file)) {
-                int filled = 0; // скільки байтів уже в буфері; на початку може лежати «хвіст» попереднього блоку
+                // Скільки валідних байтів зараз у буфері (на початку там може бути "хвіст" з попереднього кроку).
+                int filled = 0;
                 while (true) {
-                    // Дочитуємо буфер до повного розміру.
+                    // Крок 1: Дочитуємо з файлу у буфер після вже наявного хвоста (buffer[filled .. blockSize-1]).
+                    // readNBytes читає рівно стільки, скільки просимо, або менше — лише якщо файл скінчився.
                     filled += in.readNBytes(buffer, filled, blockSize - filled);
-                    boolean end = filled < blockSize; // readNBytes повертає менше лише в кінці файлу
-                    if (filled == 0) break;
-                    // Ріжемо блок по останньому пробілу, щоб слово не потрапило у два блоки.
+
+                    // Крок 2: Якщо буфер заповнений не повністю — це точно кінець файлу (EOF).
+                    boolean end = filled < blockSize;
+                    if (filled == 0) break; // файл повністю прочитаний, більше байтів немає
+
+                    // Крок 3: Шукаємо безпечну точку розрізу.
+                    // Якщо це кінець файлу — забираємо весь залишок як є.
+                    // Якщо буфер повний — відступаємо назад до останнього пробілу, щоб не розірвати слово.
                     int cut = end ? filled : cutPoint(buffer, filled);
+
+                    // Крок 4: Копіюємо цілу частину [0 .. cut) у готовий блок і додаємо до списку задач.
                     blocks.add(Arrays.copyOf(buffer, cut));
                     bytes += cut;
-                    // Хвіст після розрізу переносимо на початок буфера: з нього почнеться наступний блок.
+
+                    // Крок 5: Рятуємо обрізаний "хвіст" слова [cut .. filled) — переносимо його на початок буфера (індекс 0).
+                    // На наступній ітерації нове читання з диска допише продовження слова одразу після цього хвоста.
                     System.arraycopy(buffer, cut, buffer, 0, filled - cut);
-                    filled -= cut;
+                    filled -= cut; // тепер у буфері залишилась тільки довжина хвоста
+
                     if (end) break;
                 }
             }

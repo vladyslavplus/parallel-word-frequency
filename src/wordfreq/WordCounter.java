@@ -56,20 +56,25 @@ final class WordCounter {
 
     /** Послідовна версія (еталон): один потік проходить усі блоки по черзі в одну мапу. */
     static Result sequential(List<byte[]> blocks, int topN) {
+        // Крок 1: Засікаємо початок обчислень (етап Map) і створюємо єдину мапу: слово -> кількість.
         long start = System.nanoTime();
         Map<String, Long> counts = new HashMap<>();
         long bytes = 0, words = 0;
+
+        // Крок 2: Послідовно проходимо кожен блок і рахуємо слова у спільну мапу counts.
         for (byte[] block : blocks) {
             words += countWords(block, counts);
             bytes += block.length;
         }
         long end = System.nanoTime();
+
+        // Крок 3: Фіксуємо статистику роботи цього єдиного потоку.
         Part part = new Part(0, Thread.currentThread().getName(), start, end, blocks.size(), bytes, words,
                 counts.size(), List.of());
 
+        // Крок 4: Окремо засікаємо вибір топ-N найчастіших слів (сортування записів мапи).
         long topStart = System.nanoTime();
         List<Map.Entry<String, Long>> top = top(counts, topN);
-        // Злиття в послідовній версії немає, тому mergeNanos = 0.
         return new Result(counts, top, List.of(part), start, end - start, 0, System.nanoTime() - topStart);
     }
 
@@ -79,33 +84,36 @@ final class WordCounter {
      * dynamic = false: кожен потік заздалегідь отримує свій неперервний діапазон блоків однакової довжини.
      */
     static Result parallel(List<byte[]> blocks, int threads, boolean dynamic, int topN) throws Exception {
-        // Пул із фіксованою кількістю потоків: потоки створюються один раз і виконують задачі.
+        // Крок 1: Створюємо фіксований пул потоків (try-finally гарантує shutdown навіть при помилці).
         ExecutorService pool = Executors.newFixedThreadPool(threads);
         try {
-            // Потокобезпечна неблокувальна черга номерів блоків: poll() видає кожен номер рівно одному потоку.
+            // Крок 2: Готуємо неблокувальну чергу номерів блоків (для dynamic режиму) та масив звітів parts.
             Queue<Integer> queue = new ConcurrentLinkedQueue<>();
             for (int i = 0; i < blocks.size(); i++) queue.add(i);
             List<Callable<Map<String, Long>>> tasks = new ArrayList<>();
-            // Кожен потік пише лише у свою комірку parts[id]; головний потік читає їх після invokeAll.
-            Part[] parts = new Part[threads];
+            Part[] parts = new Part[threads]; // кожен потік пише лише у свою комірку parts[id]
+
+            // Крок 3: Формуємо по одній задачі (Map) на кожен потік.
             for (int t = 0; t < threads; t++) {
                 int id = t;
-                // Задача одного потоку (map): обробити свої блоки й повернути локальну мапу.
                 tasks.add(() -> {
                     long start = System.nanoTime();
-                    Map<String, Long> local = new HashMap<>(); // локальна мапа: інші потоки її не бачать, замки не потрібні
-                    List<long[]> events = new ArrayList<>();
+                    Map<String, Long> local = new HashMap<>(); // локальна мапа потоку (без замків)
+                    List<long[]> events = new ArrayList<>(); // журнал блоків для run_log.txt
                     long bytes = 0, words = 0;
-                    // Статичний розподіл: потік id отримує діапазон [from, to).
-                    // Приклад (10 блоків, 3 потоки): T0->[0..3), T1->[3..6), T2->[6..10).
-                    // int[1] замість int, бо лямбда в Java може змінювати елемент масиву, але не локальну змінну.
+
+                    // Статичний діапазон блоків [from, to) для потоку id (ділимо кількість блоків blocks.size(), не розмір у байтах!)
+                    // Приклад (10 блоків на 3 потоки):
+                    //   id=0: next=0*10/3=0, to=1*10/3=3 -> блоки [0, 1, 2] (3 шт.)
+                    //   id=1: next=1*10/3=3, to=2*10/3=6 -> блоки [3, 4, 5] (3 шт.)
+                    //   id=2: next=2*10/3=6, to=3*10/3=10 -> блоки [6, 7, 8, 9] (4 шт.)
                     int[] next = {(int) ((long) id * blocks.size() / threads)};
                     int to = (int) ((long) (id + 1) * blocks.size() / threads);
+
                     while (true) {
-                        // dynamic: poll() потокобезпечно забирає наступний блок із голови черги (FIFO);
-                        // static: беремо наступний індекс зі свого діапазону; null = блоків більше немає.
+                        // Беремо наступний індекс блоку: dynamic -> із черги, static -> зі свого діапазону.
                         Integer index = dynamic ? queue.poll() : next[0] < to ? Integer.valueOf(next[0]++) : null;
-                        if (index == null) break;
+                        if (index == null) break; // блоків більше немає
                         long blockStart = System.nanoTime();
                         words += countWords(blocks.get(index), local);
                         bytes += blocks.get(index).length;
@@ -117,14 +125,14 @@ final class WordCounter {
                 });
             }
 
+            // Крок 4: Запускаємо всі задачі й чекаємо завершення кожного потоку (бар'єр між Map і Reduce).
             long start = System.nanoTime();
-            // invokeAll запускає всі задачі й чекає, доки завершиться кожна, - це бар'єр між map і reduce.
             List<Future<Map<String, Long>>> futures = pool.invokeAll(tasks);
             List<Map<String, Long>> locals = new ArrayList<>();
             for (Future<Map<String, Long>> f : futures) locals.add(f.get());
             long mapNanos = System.nanoTime() - start;
 
-            // Reduce: послідовна частина алгоритму, виконує головний потік.
+            // Крок 5 (Reduce): Головний потік зливає локальні мапи в одну і рахує топ-N.
             long mergeStart = System.nanoTime();
             Map<String, Long> counts = merge(locals);
             long mergeNanos = System.nanoTime() - mergeStart;
@@ -133,7 +141,7 @@ final class WordCounter {
             List<Map.Entry<String, Long>> top = top(counts, topN);
             return new Result(counts, top, List.of(parts), start, mapNanos, mergeNanos, System.nanoTime() - topStart);
         } finally {
-            pool.shutdown(); // завершуємо потоки пулу навіть у разі помилки
+            pool.shutdown();
         }
     }
 
@@ -142,9 +150,11 @@ final class WordCounter {
      * Як основу беремо найбільшу мапу, щоб переносити менше записів. Виконується один раз, одним потоком.
      */
     static Map<String, Long> merge(List<Map<String, Long>> locals) {
+        // Крок 1: Беремо найбільшу локальну мапу за основу (щоб не копіювати її записи даремно).
         Map<String, Long> result = locals.stream().max(Comparator.comparingInt(Map::size)).orElseGet(HashMap::new);
+        // Крок 2: Переносимо слова з решти мап у result, сумуючи частоти однакових слів.
         for (Map<String, Long> local : locals) {
-            if (local == result) continue;
+            if (local == result) continue; // пропускаємо саму базову мапу, щоб не подвоїти її слова
             local.forEach((word, count) -> result.merge(word, count, Long::sum));
         }
         return result;
@@ -167,20 +177,36 @@ final class WordCounter {
      * -> "кіт" (уже є в мапі -> merge додає +1, стає кіт=2).
      */
     static long countWords(byte[] block, Map<String, Long> counts) {
-        String text = new String(block, StandardCharsets.UTF_8); // декодування лише цього блоку, не всього файлу
+        // Крок 1: Декодуємо з UTF-8 у String лише поточний 256 КБ блок (не весь гігабайтний файл одразу).
+        String text = new String(block, StandardCharsets.UTF_8);
+
+        // Крок 2: Багаторазовий буфер для складання одного слова (32 символи вистачить майже для будь-якого слова без розширень).
         StringBuilder word = new StringBuilder(32);
         long words = 0;
         int n = text.length();
+
+        // Крок 3: Проходимо по всіх символах до i == n включно.
+        // Коли i == n, штучно підставляємо пробіл ' ', щоб гарантовано завершити й записати останнє слово блоку.
         for (int i = 0; i <= n; i++) {
-            char c = i < n ? text.charAt(i) : ' '; // зайвий пробіл у кінці завершує останнє слово
+            char c = i < n ? text.charAt(i) : ' ';
+
             if (Character.isLetter(c)) {
+                // Якщо це літера (латиниця, кирилиця тощо) — приводимо до нижнього регістру й доклеюємо до слова.
                 word.append(Character.toLowerCase(c));
             } else if (isApostrophe(c) && word.length() > 0 && i + 1 < n && Character.isLetter(text.charAt(i + 1))) {
+                // Якщо це апостроф І перед ним вже є літера І після нього йде літера (напр. "п'ять") —
+                // зберігаємо його як стандартний '\'' (інакше, якщо це лапки з краю, він просто спрацює як роздільник).
                 word.append('\'');
             } else if (word.length() > 0) {
-                counts.merge(word.toString(), 1L, Long::sum); // +1 до частоти слова
+                // Сюди потрапляємо, коли символ c — НЕ літера і НЕ апостроф всередині слова (тобто слово закінчилось).
+                // Перевірка word.length() > 0 потрібна, щоб проігнорувати зайві пробіли/коми підряд (коли буфер порожній).
+                String finishedWord = word.toString();
+                // counts.merge(...) — це скорочений запис для:
+                //   if (counts.containsKey(w)) counts.put(w, counts.get(w) + 1); else counts.put(w, 1L);
+                counts.merge(finishedWord, 1L, Long::sum);
+                // Очищаємо StringBuilder, щоб збирати наступне слово (пам'ять масиву не видаляється, а перевикористовується).
                 word.setLength(0);
-                words++;
+                words++; // збільшуємо загальний лічильник знайдених слів у цьому блоці
             }
         }
         return words;
